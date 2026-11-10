@@ -26,7 +26,6 @@ A high-performance FastAPI proxy service that bridges **Navidrome** with **Deeze
 ## if you use windows WSL , use extfat format for music directory
 # I use https://one-api.ir/ for deezer api , you can use other providers that you know.
 # HOW TO USE:
-git clone 
+git clone git@github.com:mamalhendrix/fpotisy.git
 cd fpotisy
 docker compose up -d --build
-
