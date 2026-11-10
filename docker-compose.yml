@@ -1,0 +1,47 @@
+services:
+  navidrome:
+    image: deluan/navidrome:latest
+    container_name: navidrome
+    user: "1000:1000"
+    ports:
+      - "4533:4533"          # keep direct access if you want
+    restart: unless-stopped
+    environment:
+      ND_LOGLEVEL: info
+      ND_SCANSCHEDULE: 1h
+      ND_SESSIONTIMEOUT: 24h
+      ND_AGENTS: "apple-music,deezer,lastfm"
+      # ND_ENABLEDOWNLOADS: "true"   # optional
+    volumes:
+      - ./data:/data
+      - /mnt/g/navidrome/music:/music    # must be writable by uid 1000 for downloads / use extfat on wsl
+    networks:
+      - music
+
+  # Proxy that will sit in front of Navidrome and talk to One-API
+  deezer-proxy:
+    build: ./proxy          # we will create this folder next
+    container_name: deezer-proxy
+    ports:
+      - "8080:8080"          # clients should point here instead of 4533
+    restart: unless-stopped
+    environment:
+      - NAVIDROME_URL=http://navidrome:4533
+      - ONE_API_TOKEN=YOUR_ONE-API_KEY          # https://one-api.ir/
+      - MUSIC_FOLDER=/music
+      - PREFERRED_QUALITY=320                    # or FLAC / 128
+    volumes:
+      - ./proxy/main.py:/app/main.py
+      - /mnt/g/navidrome/music:/music          # same library, writable
+      - ./data:/navidrome-data  # optional, for faster ID lookup later
+      - ./proxy-cache:/app/cache        
+    depends_on:
+      - navidrome
+    networks:
+      - music
+
+networks:
+  music:
+    driver: bridge
+volumes:
+  proxy-cache:      
