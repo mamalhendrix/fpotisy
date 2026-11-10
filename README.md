@@ -16,16 +16,27 @@ A high-performance FastAPI proxy service that bridges **Navidrome** with **Deeze
 ## 📁 Project Structure
 
 ├── README.md
+
 ├── docker-compose.yml
+
 ├── data/              # Persistent data volume
+
 ├── proxy/
+
 │   ├── Dockerfile
+
 │   └── main.py        # Core FastAPI proxy application
+
 └── proxy-cache/       # Persistent SQLite cache storage
 
-## if you use windows WSL , use extfat format for music directory
-# I use https://one-api.ir/ for deezer api , you can use other providers that you know.
+
+## If you use windows WSL , use extfat format for music directory
+**** I use https://one-api.ir/ for deezer api , you can use other providers that you know.
+
 # HOW TO USE:
+
 git clone git@github.com:mamalhendrix/fpotisy.git
+
 cd fpotisy
+
 docker compose up -d --build
