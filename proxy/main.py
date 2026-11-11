@@ -2,6 +2,7 @@ import os
 import re
 import glob
 import json
+import hashlib
 import time
 import sqlite3
 import asyncio
@@ -51,7 +52,7 @@ _bg_tasks: set = set()
 _cache: dict[str, tuple] = {}
 
 # --- PERSISTENT SQLITE CACHE SETUP ---
-CACHE_DIR = os.getenv("CACHE_DIR", "./proxy_cache")
+CACHE_DIR = os.getenv("CACHE_DIR", "/app/cache")   # matches ./proxy-cache:/app/cache in the compose file
 try:
     os.makedirs(CACHE_DIR, exist_ok=True)
     _probe = os.path.join(CACHE_DIR, ".write-test")
@@ -96,10 +97,16 @@ class Store:
             items = list(self.pending.items())
         if not items:
             return
-        rows = [(ns, k, json.dumps(v), exp) for (ns, k), (v, exp) in items]
+        rows = []
+        for (ns, k), (v, exp) in items:
+            try:
+                rows.append((ns, k, json.dumps(v), exp))
+            except (TypeError, ValueError) as e:     # one bad entry must not block every other write
+                print(f"Dropping cache entry {ns}:{k} that cannot be stored: {e!r}")
         with self.lock:
-            self.db.executemany("INSERT OR REPLACE INTO kv (ns, k, v, exp) VALUES (?,?,?,?)", rows)
-            self.db.commit()
+            if rows:
+                self.db.executemany("INSERT OR REPLACE INTO kv (ns, k, v, exp) VALUES (?,?,?,?)", rows)
+                self.db.commit()
             for key, val in items:
                 if self.pending.get(key) is val:
                     del self.pending[key]
@@ -143,6 +150,58 @@ class PDict(dict):
 
     def __contains__(self, k):
         return self._load(k)
+
+
+COVER_DIR = os.path.join(CACHE_DIR, "covers")
+os.makedirs(COVER_DIR, exist_ok=True)
+COVER_CACHE_MB = int(os.getenv("COVER_CACHE_MB", "300"))
+
+
+def _cover_base(url: str) -> str:
+    return os.path.join(COVER_DIR, hashlib.sha1(url.encode()).hexdigest())
+
+
+def read_cover(url: str):
+    base = _cover_base(url)
+    for ext, ct in (("jpg", "image/jpeg"), ("png", "image/png"), ("webp", "image/webp")):
+        if os.path.exists(f"{base}.{ext}"):
+            with open(f"{base}.{ext}", "rb") as fh:
+                return fh.read(), ct
+    return None
+
+
+def write_cover(url: str, content: bytes, content_type: str):
+    ext = "png" if "png" in content_type else "webp" if "webp" in content_type else "jpg"
+    path = f"{_cover_base(url)}.{ext}"
+    with open(path + ".tmp", "wb") as fh:
+        fh.write(content)
+    os.replace(path + ".tmp", path)
+
+
+def refresh_covers():
+    """One-time clean-up (REFRESH_COVERS=1): forget every stored cover URL and image file."""
+    removed = 0
+    for p in glob.glob(os.path.join(COVER_DIR, "*")):
+        try:
+            os.remove(p)
+            removed += 1
+        except OSError:
+            pass
+    with store.lock:
+        cur = store.db.execute("DELETE FROM kv WHERE ns IN ('cover_urls', 'cover_blob')")
+        store.db.commit()
+    print(f"REFRESH_COVERS: removed {removed} cached images and {cur.rowcount} stored cover URLs. "
+          f"Remove REFRESH_COVERS from the environment now, or this repeats on every start.")
+
+
+def trim_covers():
+    files = [(os.path.getmtime(p), os.path.getsize(p), p) for p in glob.glob(os.path.join(COVER_DIR, "*.*"))]
+    total = sum(f[1] for f in files)
+    for _, size, path in sorted(files):
+        if total <= COVER_CACHE_MB * 1024 * 1024:
+            break
+        os.remove(path)
+        total -= size
 
 
 track_mapping = PDict("track_mapping")
@@ -243,6 +302,9 @@ async def _flush_loop():
 @app.on_event("startup")
 async def _startup():
     await asyncio.to_thread(store.purge)
+    if os.getenv("REFRESH_COVERS") == "1":
+        await asyncio.to_thread(refresh_covers)
+    await asyncio.to_thread(trim_covers)
     asyncio.create_task(_flush_loop())
 
 
@@ -267,6 +329,8 @@ async def api_get(path: str, retries: int = 3):
                 await asyncio.sleep(1.5 * (attempt + 1))
         raise HTTPException(502, f"One-API unreachable: {last!r}")
     
+    if "/download/" in path:            # signed links expire; "quality not found" answers should be re-checked
+        return await fetch()
     return await cached_call(f"oneapi:{path}", 86400, fetch)
 
 
@@ -288,7 +352,7 @@ def deezer_track_to_subsonic(t: dict) -> dict:
         "deezer_id": str(t.get('id'))
     }
     
-    artwork = album_info.get('cover_medium') or album_info.get('cover_xl') or ''
+    artwork = album_info.get('cover_big') or album_info.get('cover_medium') or album_info.get('cover_xl') or ''
     if artwork:
         cover_urls[t_id] = artwork
         cover_urls[album_id] = artwork
@@ -363,7 +427,7 @@ def itunes_playlist_to_subsonic(p: dict) -> dict:
     artist = p.get('artistName', 'Apple Music')
     playlist_cache[pid] = {"id": pid, "name": title, "collectionId": p.get('collectionId')}
     
-    artwork = t.get('artworkUrl100', '').replace('100x100bb', '600x600bb') if 't' in locals() else ''
+    artwork = (p.get('artworkUrl100') or '').replace('100x100bb', '600x600bb')
     if artwork:
         cover_urls[pid] = artwork
 
@@ -416,6 +480,7 @@ async def fetch_file(url: str, dest: str, attempts: int = 6):
     for attempt in range(attempts):
         pos = os.path.getsize(tmp) if os.path.exists(tmp) else 0
         headers = {"Range": f"bytes={pos}-"} if pos else {}
+        expected_total = None
         try:
             async with http.stream("GET", url, headers=headers, timeout=httpx.Timeout(120.0, connect=30.0)) as r:
                 if r.status_code == 416:
@@ -423,13 +488,25 @@ async def fetch_file(url: str, dest: str, attempts: int = 6):
                     return
                 if r.status_code not in (200, 206):
                     raise httpx.HTTPStatusError("bad status", request=r.request, response=r)
+                cl = r.headers.get("content-length", "")
+                if cl.isdigit():
+                    expected_total = int(cl) + (pos if r.status_code == 206 else 0)
                 mode = "ab" if (pos and r.status_code == 206) else "wb"
                 with open(tmp, mode) as f:
-                    async for chunk in r.aiter_bytes(65536):
+                    # aiter_raw writes every piece as it arrives. aiter_bytes() re-chunks into 64 KB blocks, so
+                    # when the connection drops, everything still buffered is lost and resume cannot work.
+                    async for chunk in r.aiter_raw():
                         f.write(chunk)
             os.replace(tmp, dest)
             return
         except (httpx.TransportError, httpx.HTTPStatusError, asyncio.TimeoutError) as e:
+            size = os.path.getsize(tmp) if os.path.exists(tmp) else 0
+            # Some hosts always close the connection 1-2 bytes early. A file that is only a few bytes
+            # short still plays, so accept it instead of retrying forever.
+            if expected_total and size and 0 <= expected_total - size <= 1024:
+                print(f"Download is {expected_total - size} byte(s) short of {expected_total}; accepting it")
+                os.replace(tmp, dest)
+                return
             print(f"Download interrupted (attempt {attempt + 1}/{attempts}): {e!r}")
             await asyncio.sleep(3 * (attempt + 1))
     raise HTTPException(502, "Download from Deezer failed after retries")
@@ -444,8 +521,15 @@ async def trigger_scan(auth_params: dict):
 
 async def ensure_local(song_id: str, auth_params: dict) -> str:
     meta = track_mapping.get(song_id)
-    if not meta:
-        raise HTTPException(404, f"Track mapping missing for: {song_id}")
+    if not meta:                                   # e.g. a play queue saved before a restart
+        raw_id = song_id.replace("deezer-", "")
+        if not raw_id.isdigit():
+            raise HTTPException(404, f"Track mapping missing for: {song_id}")
+        info = (await api_get(f"/track/{raw_id}")).get("result") or {}
+        if not info.get("id"):
+            raise HTTPException(404, f"Track {raw_id} not found")
+        deezer_track_to_subsonic(info)
+        meta = track_mapping.get(song_id)
 
     deezer_id = meta.get("deezer_id") or song_id.replace("deezer-", "")
     if not deezer_id.isdigit():
@@ -466,8 +550,9 @@ async def ensure_local(song_id: str, auth_params: dict) -> str:
         for q in qualities_to_try:
             try:
                 dl = await api_get(f"/track/{deezer_id}/download/{q}")
-                url = dl.get("result", {}).get("url")
+                url = (dl.get("result") or {}).get("url")
                 if url:
+                    print(f"Track {deezer_id}: downloading at quality {q}" + ("" if q == QUALITY else f" ({QUALITY} not available)"))
                     break
             except HTTPException:
                 continue
@@ -560,6 +645,39 @@ async def fetch_deezer_album_payload(deezer_album_id: str, album_id: str):
     except Exception as e:
         print(f"Failed to fetch Deezer album tracks: {e!r}")
         return None
+
+
+async def resolve_cover_url(item_id: str):
+    """Image URL for one of our ids, looked up again if the in-memory/SQLite copy is missing."""
+    url = cover_urls.get(item_id)
+    if url:
+        return url
+    try:
+        if item_id.startswith("deezer-album-"):
+            d = (await api_get(f"/album/{item_id.replace('deezer-album-', '')}")).get("result") or {}
+            url = d.get("cover_big") or d.get("cover_medium") or d.get("cover_xl")
+        elif item_id.startswith("deezer-artist-"):
+            d = (await api_get(f"/artist/{item_id.replace('deezer-artist-', '')}")).get("result") or {}
+            url = d.get("picture_big") or d.get("picture_medium") or d.get("picture_xl")
+        elif item_id.startswith("deezer-") and item_id.replace("deezer-", "").isdigit():
+            album_id = (track_mapping.get(item_id) or {}).get("albumId")
+            if album_id and album_id != "deezer-album-0":
+                return await resolve_cover_url(album_id)
+            d = ((await api_get(f"/track/{item_id.replace('deezer-', '')}")).get("result") or {}).get("album") or {}
+            url = d.get("cover_big") or d.get("cover_medium") or d.get("cover_xl")
+        elif item_id.startswith(("itunes-album-", "itunes-playlist-")):
+            ident = item_id.split("-")[-1]
+            for item in await itunes_lookup(id=ident):
+                art = (item.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
+                if art:
+                    url = art
+                    break
+    except Exception as e:
+        print(f"Could not resolve cover for {item_id}: {e!r}")
+        return None
+    if url:
+        cover_urls[item_id] = url
+    return url
 
 
 # ---------- AUTH CHECK ----------
@@ -736,7 +854,10 @@ async def subsonic_proxy(endpoint: str, request: Request):
                 if norm(na.get("name")) not in have:
                     albums.append(na)
 
-        artist_cover = cover_urls.get(artist_id) or (albums[0].get("coverArt") if albums else None)
+        artist_cover = cover_urls.get(artist_id)
+        if not artist_cover:
+            artist_cover = next((cover_urls.get(a["coverArt"]) for a in albums
+                                 if a.get("coverArt") and cover_urls.get(a["coverArt"])), None)
         if artist_cover:
             cover_urls[artist_id] = artist_cover
 
@@ -789,54 +910,41 @@ async def subsonic_proxy(endpoint: str, request: Request):
             res_payload = await fetch_full_deezer_album_payload(collection_id, target_id)
             return subsonic_ok(album=res_payload)
     
-    # 1c. COVER ART handling with persistent local cache
+    # 1c. COVER ART handling with persistent disk cache & Navidrome fallback
     if endpoint == "getCoverArt":
         item_id = params.get("id", "")
-        
-        # 1. Check if cached in SQLite
-        cached_record = store.get("cover_blob", item_id)
-        if cached_record and cached_record[1] > time.time():
-            blob, c_type = cached_record[0]
-            return Response(content=blob, media_type=c_type, headers={"Cache-Control": "public, max-age=604800"})
 
+        # A. If it's one of our proxy IDs
+        if item_id.startswith(("deezer-", "itunes-")):
+            url = await resolve_cover_url(item_id)
+            if url:
+                headers = {"Cache-Control": "public, max-age=604800"}
+                cached = await asyncio.to_thread(read_cover, url)
+                if cached:
+                    return Response(content=cached[0], media_type=cached[1], headers=headers)
+                try:
+                    r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
+                    if r.status_code == 200:
+                        ctype = r.headers.get("content-type", "image/jpeg")
+                        await asyncio.to_thread(write_cover, url, r.content, ctype)
+                        return Response(content=r.content, media_type=ctype, headers=headers)
+                except Exception as e:
+                    print(f"Failed to fetch cover art from {url}: {e!r}")
+
+        # B. Fallback logic for local Navidrome IDs (e.g. ar-..., album IDs, or tracks)
         url = cover_urls.get(item_id)
-        
-        # 2. Fallback resolution for Deezer/iTunes IDs if URL isn't cached yet
-        if not url:
-            if item_id.startswith("deezer-album-"):
-                try:
-                    res = await api_get(f"/album/{item_id.replace('deezer-album-', '')}")
-                    data = res.get("result", {})
-                    url = data.get("cover_medium") or data.get("cover_xl")
-                    if url:
-                        cover_urls[item_id] = url
-                except Exception:
-                    pass
-            elif item_id.startswith("itunes-album-"):
-                try:
-                    results = await itunes_lookup(id=item_id.replace("itunes-album-", ""))
-                    for item in results:
-                        art = (item.get("artworkUrl100") or "").replace("100x100bb", "600x600bb")
-                        if art:
-                            url = art
-                            cover_urls[item_id] = art
-                            break
-                except Exception:
-                    pass
-
-        # 3. Download, cache locally in SQLite, and return
         if url:
+            cached = await asyncio.to_thread(read_cover, url)
+            if cached:
+                return Response(content=cached[0], media_type=cached[1], headers={"Cache-Control": "public, max-age=604800"})
             try:
-                r = await http.get(url, headers=ITUNES_HEADERS)
+                r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
                 if r.status_code == 200:
-                    blob = r.content
-                    c_type = r.headers.get("content-type", "image/jpeg")
-                    store.put("cover_blob", item_id, (blob, c_type), 30 * 86400)
-                    return Response(content=blob, media_type=c_type, headers={"Cache-Control": "public, max-age=604800"})
-            except Exception as e:
-                print(f"Failed to fetch cover art from URL {url}: {e!r}")
-        
-        return await passthrough(endpoint, params)
-
+                    ctype = r.headers.get("content-type", "image/jpeg")
+                    await asyncio.to_thread(write_cover, url, r.content, ctype)
+                    return Response(content=r.content, media_type=ctype, headers={"Cache-Control": "public, max-age=604800"})
+            except Exception:
+                pass
     # 4. DEFAULT PASSTHROUGH TO NAVIDROME
     return await passthrough(endpoint, params)
+
