@@ -15,7 +15,7 @@ from fastapi import FastAPI, Request, HTTPException, Response
 from fastapi.responses import StreamingResponse, FileResponse
 from starlette.background import BackgroundTask
 from mutagen.mp3 import MP3
-from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TRCK, TDRC
+from mutagen.id3 import ID3, TIT2, TPE1, TPE2, TALB, TRCK, TDRC, APIC
 
 app = FastAPI()
 
@@ -35,6 +35,13 @@ NAVIDROME_URL = os.getenv("NAVIDROME_URL", "http://navidrome:4533")
 MUSIC_DIR = os.getenv("MUSIC_FOLDER", "/music")
 ONE_API_TOKEN = os.getenv("ONE_API_TOKEN", "")
 ONE_API_URL = "https://api.one-api.ir/deezer/v1"
+
+# Search / metadata come from Deezer's own free API; One-API is only used for downloads.
+# DEEZER_API can point at a relay if the server cannot reach api.deezer.com directly.
+DEEZER_API = os.getenv("DEEZER_API", "https://api.deezer.com").rstrip("/")
+DEEZER_RELAY_KEY = os.getenv("DEEZER_RELAY_KEY", "")
+# Off by default: when on, every lookup costs One-API quota whenever Deezer is unreachable.
+ONE_API_CATALOG_FALLBACK = os.getenv("ONE_API_CATALOG_FALLBACK", "0") == "1"
 QUALITY = os.getenv("PREFERRED_QUALITY", "320")
 
 ITUNES_URL = "https://itunes.apple.com"
@@ -232,7 +239,7 @@ async def fetch_full_deezer_album_payload(collection_id: str, album_id: str):
             # Search Deezer for this track to get a real streamable deezer ID!
             deezer_track_id = None
             try:
-                search_res = await api_get(f"/search/track?q={urllib.parse.quote(f'{t_artist} {t_name}')}&limit=1")
+                search_res = await dz_api(f"/search/track?q={urllib.parse.quote(f'{t_artist} {t_name}')}&limit=1")
                 cands = search_res.get("result", {}).get("data", [])
                 if cands:
                     dt = cands[0]
@@ -306,6 +313,8 @@ async def _startup():
         await asyncio.to_thread(refresh_covers)
     await asyncio.to_thread(trim_covers)
     asyncio.create_task(_flush_loop())
+    if os.getenv("BACKFILL_COVERS") == "1":
+        asyncio.create_task(backfill_covers())
 
 
 @app.on_event("shutdown")
@@ -316,22 +325,64 @@ async def _shutdown():
 
 # ---------- ONE-API (DEEZER) ----------
 
+async def _one_api_fetch(path: str, retries: int = 3):
+    last = None
+    for attempt in range(retries):
+        try:
+            r = await http.get(f"{ONE_API_URL}{path}", headers={"one-api-token": ONE_API_TOKEN})
+            r.raise_for_status()
+            return r.json()
+        except (httpx.TransportError, httpx.HTTPStatusError) as e:
+            last = e
+            await asyncio.sleep(1.5 * (attempt + 1))
+    raise HTTPException(502, f"One-API unreachable: {last!r}")
+
+
 async def api_get(path: str, retries: int = 3):
-    async def fetch():
-        last = None
-        for attempt in range(retries):
-            try:
-                r = await http.get(f"{ONE_API_URL}{path}", headers={"one-api-token": ONE_API_TOKEN})
-                r.raise_for_status()
-                return r.json()
-            except (httpx.TransportError, httpx.HTTPStatusError) as e:
-                last = e
-                await asyncio.sleep(1.5 * (attempt + 1))
-        raise HTTPException(502, f"One-API unreachable: {last!r}")
-    
+    """One-API. Used for download links only (see dz_api for search and metadata)."""
     if "/download/" in path:            # signed links expire; "quality not found" answers should be re-checked
-        return await fetch()
-    return await cached_call(f"oneapi:{path}", 86400, fetch)
+        return await _one_api_fetch(path, retries)
+    return await cached_call(f"oneapi:{path}", 86400, lambda: _one_api_fetch(path, retries))
+
+
+_deezer_down_until = 0.0
+
+
+async def dz_api(path: str):
+    """Search and metadata from api.deezer.com. Answers look like One-API's ({"result": ...}) so the rest of
+    the code is unchanged. Cached on disk; if Deezer is unreachable an older cached answer is used."""
+    async def fetch():
+        global _deezer_down_until
+        if time.monotonic() >= _deezer_down_until:
+            for attempt in range(2):
+                try:
+                    r = await http.get(
+                        f"{DEEZER_API}{path}",
+                        headers={"x-relay-key": DEEZER_RELAY_KEY} if DEEZER_RELAY_KEY else None,
+                        timeout=httpx.Timeout(10.0, connect=4.0),
+                    )
+                    r.raise_for_status()
+                    d = r.json()
+                except (httpx.TransportError, httpx.HTTPStatusError, ValueError) as e:
+                    print(f"Deezer API unreachable ({e!r}); not trying it again for 2 minutes")
+                    _deezer_down_until = time.monotonic() + 120
+                    break
+                err = d.get("error") if isinstance(d, dict) else None
+                if not err:
+                    return {"result": d}
+                if err.get("code") == 4 and attempt == 0:     # rate limit (about 50 requests / 5 s): wait, retry once
+                    await asyncio.sleep(1.5)
+                    continue
+                if err.get("code") == 800:                    # no such artist / album / track
+                    raise HTTPException(404, "Not found on Deezer")
+                print(f"Deezer API error on {path}: {err}")
+                _deezer_down_until = time.monotonic() + 10
+                break
+        if ONE_API_CATALOG_FALLBACK:
+            return await _one_api_fetch(path)
+        raise HTTPException(502, "Deezer API unavailable (One-API is only used for downloads)")
+
+    return await cached_call(f"dz:{path}", 86400, fetch)
 
 
 def deezer_track_to_subsonic(t: dict) -> dict:
@@ -525,7 +576,7 @@ async def ensure_local(song_id: str, auth_params: dict) -> str:
         raw_id = song_id.replace("deezer-", "")
         if not raw_id.isdigit():
             raise HTTPException(404, f"Track mapping missing for: {song_id}")
-        info = (await api_get(f"/track/{raw_id}")).get("result") or {}
+        info = (await dz_api(f"/track/{raw_id}")).get("result") or {}
         if not info.get("id"):
             raise HTTPException(404, f"Track {raw_id} not found")
         deezer_track_to_subsonic(info)
@@ -569,6 +620,15 @@ async def ensure_local(song_id: str, auth_params: dict) -> str:
 
         print(f"Downloading {artist} - {title}")
         await fetch_file(url, dest)
+
+        cover = None                                   # Navidrome can only show covers that are inside the file
+        try:
+            curl = await resolve_cover_url(song_id)
+            if curl:
+                cover = await fetch_cover_bytes(curl)
+        except Exception as e:
+            print(f"No cover to embed for {song_id}: {e!r}")
+
         try:
             audio = MP3(dest, ID3=ID3)
             if audio.tags is None:
@@ -580,6 +640,9 @@ async def ensure_local(song_id: str, auth_params: dict) -> str:
                 audio.tags.add(TALB(encoding=3, text=meta["album"]))
             if meta.get("track"):
                 audio.tags.add(TRCK(encoding=3, text=str(meta["track"])))
+            if cover:
+                audio.tags.delall("APIC")
+                audio.tags.add(APIC(encoding=3, mime=cover[1], type=3, desc="Cover", data=cover[0]))
             audio.save()
         except Exception as e:
             print(f"Tagging failed (file still saved): {e}")
@@ -588,6 +651,90 @@ async def ensure_local(song_id: str, auth_params: dict) -> str:
         _bg_tasks.add(t)
         t.add_done_callback(_bg_tasks.discard)
         return dest
+
+
+# ---------- ARTIST PICTURES, TOP SONGS ----------
+
+def public_base(request: Request) -> str:
+    """Address the phone uses to reach this proxy (behind Pangolin/Traefik). Override with PUBLIC_URL."""
+    env = os.getenv("PUBLIC_URL", "").rstrip("/")
+    if env:
+        return env
+    proto = request.headers.get("x-forwarded-proto") or request.url.scheme
+    host = request.headers.get("x-forwarded-host") or request.headers.get("host") or request.url.netloc
+    return f"{proto.split(',')[0].strip()}://{host.split(',')[0].strip()}"
+
+
+def image_url(request: Request, params: dict, cover_id: str, size: int = 600) -> str:
+    """A getCoverArt URL for this proxy with the caller's own login, for clients that load artist images by URL."""
+    auth = {k: params[k] for k in ("u", "t", "s", "p", "v", "c") if k in params}
+    return f"{public_base(request)}/rest/getCoverArt?" + urllib.parse.urlencode({"id": cover_id, "size": size, **auth})
+
+
+def resize_deezer(url: str, size) -> str:
+    """Deezer's image CDN serves any square size; lists ask for small ones, headers for big ones."""
+    try:
+        px = min(max(int(size), 100), 1000)
+    except (TypeError, ValueError):
+        return url
+    return re.sub(r"/(\d+)x\1-", f"/{px}x{px}-", url) if "dzcdn.net" in url else url
+
+
+async def deezer_artist_lookup(name: str):
+    """{id, name, picture} of the Deezer artist with this name, cached (also remembers 'not found')."""
+    key = norm(name)
+    hit = store.get("artist_lookup", key)
+    if hit and hit[1] > time.time():
+        return hit[0] or None
+    result = None
+    try:
+        data = (await dz_api(f"/search/artist?q={urllib.parse.quote(name)}&limit=5")).get("result", {}).get("data", [])
+        pick = next((a for a in data if norm(a.get("name")) == key), None) or (data[0] if len(data) == 1 else None)
+        if pick:
+            result = {"id": pick["id"], "name": pick.get("name"),
+                      "picture": pick.get("picture_xl") or pick.get("picture_big") or pick.get("picture_medium")}
+    except Exception as e:
+        print(f"Artist search failed for {name!r}: {e!r}")
+    if not result:                               # fall back to the artist objects inside track results
+        try:
+            data = (await dz_api(f"/search/track?q={urllib.parse.quote(name)}&limit=10")).get("result", {}).get("data", [])
+            for t in data:
+                a = t.get("artist") or {}
+                if norm(a.get("name")) == key and a.get("id"):
+                    result = {"id": a["id"], "name": a.get("name"),
+                              "picture": a.get("picture_xl") or a.get("picture_big") or a.get("picture_medium")}
+                    break
+        except Exception as e:
+            print(f"Artist track-search fallback failed for {name!r}: {e!r}")
+    store.put("artist_lookup", key, result or {}, 30 * 86400 if result else 86400)
+    return result
+
+
+async def deezer_top_songs(name: str, count: int) -> list:
+    info = await deezer_artist_lookup(name)
+    if not info:
+        return []
+    tracks = []
+    try:
+        tracks = (await dz_api(f"/artist/{info['id']}/top?limit={min(count, 50)}")).get("result", {}).get("data", [])
+    except Exception as e:
+        print(f"/artist/top failed ({e!r}); falling back to a track search")
+    if not tracks:
+        try:
+            q = urllib.parse.quote(f'artist:"{name}"')
+            found = (await dz_api(f"/search/track?q={q}&limit={min(count, 50)}")).get("result", {}).get("data", [])
+            tracks = [t for t in found if norm((t.get("artist") or {}).get("name")) == norm(name)]
+        except Exception as e:
+            print(f"Top songs search failed for {name!r}: {e!r}")
+    return [deezer_track_to_subsonic(t) for t in tracks if t.get("id")][:count]
+
+
+def with_image(payload: dict, request: Request, params: dict) -> dict:
+    """Copy of an artist payload that also carries artistImageUrl (the login is not stored in the cache)."""
+    out = dict(payload)
+    if out.get("coverArt"):
+        out["artistImageUrl"] = image_url(request, params, out["coverArt"])
+    return out
 
 
 async def passthrough(endpoint: str, params: dict):
@@ -609,7 +756,7 @@ async def fetch_deezer_album_payload(deezer_album_id: str, album_id: str):
         return cached_payload[0]
 
     try:
-        res = await api_get(f"/album/{deezer_album_id}")
+        res = await dz_api(f"/album/{deezer_album_id}")
         data = res.get("result", {})
         album_name = data.get("title", "Album")
         artist_name = data.get("artist", {}).get("name", "Unknown Artist")
@@ -617,7 +764,8 @@ async def fetch_deezer_album_payload(deezer_album_id: str, album_id: str):
         
         tracks_data = data.get("tracks", {}).get("data", [])
         songs = []
-        for t in tracks_data:
+        for idx, t in enumerate(tracks_data, 1):
+            t.setdefault("track_position", idx)
             # Ensure proper fields for deezer track conversion
             t["album"] = {"title": album_name, "id": deezer_album_id, "cover_medium": artwork_url}
             if not t.get("artist"):
@@ -647,6 +795,35 @@ async def fetch_deezer_album_payload(deezer_album_id: str, album_id: str):
         return None
 
 
+async def fetch_cover_bytes(url: str):
+    """(bytes, mime) for an image URL, using the on-disk cover cache."""
+    cached = await asyncio.to_thread(read_cover, url)
+    if cached:
+        return cached
+    r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
+    if r.status_code != 200:
+        return None
+    ctype = r.headers.get("content-type", "image/jpeg")
+    await asyncio.to_thread(write_cover, url, r.content, ctype)
+    return r.content, ctype
+
+
+def embed_cover(path: str, data: bytes, mime: str):
+    audio = MP3(path, ID3=ID3)
+    if audio.tags is None:
+        audio.add_tags()
+    audio.tags.delall("APIC")
+    audio.tags.add(APIC(encoding=3, mime=mime, type=3, desc="Cover", data=data))
+    audio.save()
+
+
+def has_cover(path: str) -> bool:
+    try:
+        return bool(ID3(path).getall("APIC"))
+    except Exception:
+        return False
+
+
 async def resolve_cover_url(item_id: str):
     """Image URL for one of our ids, looked up again if the in-memory/SQLite copy is missing."""
     url = cover_urls.get(item_id)
@@ -654,16 +831,16 @@ async def resolve_cover_url(item_id: str):
         return url
     try:
         if item_id.startswith("deezer-album-"):
-            d = (await api_get(f"/album/{item_id.replace('deezer-album-', '')}")).get("result") or {}
+            d = (await dz_api(f"/album/{item_id.replace('deezer-album-', '')}")).get("result") or {}
             url = d.get("cover_big") or d.get("cover_medium") or d.get("cover_xl")
         elif item_id.startswith("deezer-artist-"):
-            d = (await api_get(f"/artist/{item_id.replace('deezer-artist-', '')}")).get("result") or {}
+            d = (await dz_api(f"/artist/{item_id.replace('deezer-artist-', '')}")).get("result") or {}
             url = d.get("picture_big") or d.get("picture_medium") or d.get("picture_xl")
         elif item_id.startswith("deezer-") and item_id.replace("deezer-", "").isdigit():
             album_id = (track_mapping.get(item_id) or {}).get("albumId")
             if album_id and album_id != "deezer-album-0":
                 return await resolve_cover_url(album_id)
-            d = ((await api_get(f"/track/{item_id.replace('deezer-', '')}")).get("result") or {}).get("album") or {}
+            d = ((await dz_api(f"/track/{item_id.replace('deezer-', '')}")).get("result") or {}).get("album") or {}
             url = d.get("cover_big") or d.get("cover_medium") or d.get("cover_xl")
         elif item_id.startswith(("itunes-album-", "itunes-playlist-")):
             ident = item_id.split("-")[-1]
@@ -678,6 +855,52 @@ async def resolve_cover_url(item_id: str):
     if url:
         cover_urls[item_id] = url
     return url
+
+
+async def backfill_covers():
+    """BACKFILL_COVERS=1: add cover art to files downloaded earlier (up to BACKFILL_MAX files per start).
+    Costs about one One-API call per album, not per track."""
+    limit = int(os.getenv("BACKFILL_MAX", "300"))
+    pattern = re.compile(r" \[(\d+)\]\.mp3$")
+    todo = []
+    for folder, _, files in os.walk(MUSIC_DIR):
+        for name in files:
+            m = pattern.search(name)
+            if m:
+                todo.append((os.path.join(folder, name), m.group(1)))
+    print(f"BACKFILL_COVERS: {len(todo)} downloaded files found, checking for missing covers")
+    album_cover: dict = {}
+    done = skipped = failed = 0
+    for path, deezer_id in todo:
+        if done >= limit:
+            print(f"BACKFILL_COVERS: reached BACKFILL_MAX={limit}; restart to continue with the rest")
+            break
+        if await asyncio.to_thread(has_cover, path):
+            skipped += 1
+            continue
+        try:
+            tags = await asyncio.to_thread(lambda: ID3(path))
+            key = (str(tags.get("TPE1", "")), str(tags.get("TALB", "")))
+        except Exception:
+            key = (path, "")
+        try:
+            url = album_cover.get(key) if key[1] else None
+            if not url:
+                url = await resolve_cover_url(f"deezer-{deezer_id}")
+                await asyncio.sleep(0.4)               # be gentle with One-API
+                if url and key[1]:
+                    album_cover[key] = url
+            cover = await fetch_cover_bytes(url) if url else None
+            if not cover:
+                failed += 1
+                continue
+            await asyncio.to_thread(embed_cover, path, cover[0], cover[1])
+            done += 1
+        except Exception as e:
+            failed += 1
+            print(f"BACKFILL_COVERS: {os.path.basename(path)}: {e!r}")
+    print(f"BACKFILL_COVERS finished: {done} updated, {skipped} already had a cover, {failed} failed. "
+          f"Remove BACKFILL_COVERS from the environment, then let Navidrome rescan.")
 
 
 # ---------- AUTH CHECK ----------
@@ -742,7 +965,7 @@ async def subsonic_proxy(endpoint: str, request: Request):
             seen_artists = {norm(x.get("name")) for x in local_artists}
 
             try:
-                deezer_res = await api_get(f"/search/track?q={urllib.parse.quote(query)}&limit=30")
+                deezer_res = await dz_api(f"/search/track?q={urllib.parse.quote(query)}&limit=30")
                 deezer_tracks = deezer_res.get("result", {}).get("data", [])
                 extra_songs = [deezer_track_to_subsonic(t) for t in deezer_tracks]
                 extra_songs = [x for x in extra_songs if (norm(x["artist"]), norm(x["title"])) not in seen_songs]
@@ -789,19 +1012,94 @@ async def subsonic_proxy(endpoint: str, request: Request):
 
         return Response(content=json.dumps(data), media_type="application/json")
         
+    # 1c'. LIBRARY ARTIST PICTURES: Navidrome first; if it has none (its image sources are blocked), use Deezer's
+    if endpoint == "getCoverArt" and params.get("id", "").startswith("ar-"):
+        art_id = params["id"]
+        try:
+            nav = await http.get(f"{NAVIDROME_URL}/rest/getCoverArt", params=params, timeout=httpx.Timeout(15.0, connect=5.0))
+            if nav.status_code == 200 and nav.headers.get("content-type", "").startswith("image"):
+                return Response(content=nav.content, media_type=nav.headers["content-type"],
+                                headers={"Cache-Control": "public, max-age=86400"})
+        except Exception as e:
+            print(f"Navidrome artist cover failed: {e!r}")
+        url = cover_urls.get(art_id)
+        if not url:
+            try:
+                info_res = await http.get(f"{NAVIDROME_URL}/rest/getArtist", params={
+                    **{k: v for k, v in params.items() if k in ("u", "p", "t", "s", "v", "c")},
+                    "f": "json", "id": art_id.replace("ar-", "", 1)})
+                name = info_res.json().get("subsonic-response", {}).get("artist", {}).get("name")
+            except Exception:
+                name = None
+            info = await deezer_artist_lookup(name) if name else None
+            if info and info.get("picture"):
+                url = info["picture"]
+                cover_urls[art_id] = url
+        if url:
+            url = resize_deezer(url, params.get("size"))
+            cached = await asyncio.to_thread(read_cover, url)
+            if not cached:
+                cached = await fetch_cover_bytes(url)
+            if cached:
+                return Response(content=cached[0], media_type=cached[1], headers={"Cache-Control": "public, max-age=604800"})
+        raise HTTPException(404, "No artist picture")
+
+    # 1d'. ARTIST INFO: picture URLs that go through this proxy (the phone cannot reach Deezer's image servers)
+    if endpoint in ("getArtistInfo2", "getArtistInfo") and params.get("f") == "json":
+        key = "artistInfo2" if endpoint.endswith("2") else "artistInfo"
+        aid = params.get("id", "")
+        cover_id = aid if aid.startswith(("ar-", "deezer-artist-")) else f"ar-{aid}"
+        images = {"smallImageUrl": image_url(request, params, cover_id, 160),
+                  "mediumImageUrl": image_url(request, params, cover_id, 320),
+                  "largeImageUrl": image_url(request, params, cover_id, 800)}
+        if aid.startswith("deezer-artist-"):
+            return subsonic_ok(**{key: {"biography": "", "similarArtist": [], **images}})
+        try:
+            nav = await http.get(f"{NAVIDROME_URL}/rest/{endpoint}", params={**params, "f": "json"})
+            data = nav.json()
+            node = data.setdefault("subsonic-response", {}).setdefault(key, {})
+            node.update(images)
+            return Response(content=json.dumps(data), media_type="application/json")
+        except Exception as e:
+            print(f"{endpoint}: Navidrome failed ({e!r}), returning images only")
+            return subsonic_ok(**{key: images})
+
+    # 1e'. TOP SONGS: Navidrome's list (library tracks only) first, then the artist's top tracks from Deezer
+    if endpoint == "getTopSongs" and params.get("artist") and params.get("f") == "json":
+        name = params["artist"]
+        count = max(1, min(int(params.get("count", 50) or 50), 50))
+        local_songs = []
+        try:
+            nav = await http.get(f"{NAVIDROME_URL}/rest/getTopSongs", params={**params, "f": "json"})
+            local_songs = nav.json().get("subsonic-response", {}).get("topSongs", {}).get("song", []) or []
+        except Exception:
+            pass
+        remote = []
+        cached = store.get("top_songs", norm(name))
+        if cached and cached[1] > time.time():
+            remote = cached[0]
+        else:
+            remote = await deezer_top_songs(name, 50)
+            if remote:
+                store.put("top_songs", norm(name), remote, 12 * 3600)
+        seen = {(norm(x.get("artist")), tkey(x.get("title"))) for x in local_songs}
+        merged = local_songs + [x for x in remote if (norm(x.get("artist")), tkey(x.get("title"))) not in seen]
+        if merged:
+            return subsonic_ok(topSongs={"song": merged[:count]})
+
     # 1d. GETARTIST: Intercept artist requests and fetch full albums from Deezer/iTunes
     if endpoint == "getArtist":
         artist_id = params.get("id", "")
         
         cached_payload = store.get("artist_payload", artist_id)
         if cached_payload and cached_payload[1] > time.time():
-            return subsonic_ok(artist=cached_payload[0])
+            return subsonic_ok(artist=with_image(cached_payload[0], request, params))
 
         artist_name = "Unknown Artist"
         if artist_id.startswith("deezer-artist-"):
             art_num = artist_id.replace("deezer-artist-", "")
             try:
-                res = await api_get(f"/artist/{art_num}")
+                res = await dz_api(f"/artist/{art_num}")
                 artist_name = res.get("result", {}).get("name", "Unknown Artist")
             except Exception:
                 pass
@@ -823,7 +1121,7 @@ async def subsonic_proxy(endpoint: str, request: Request):
         seen_albums = set()
         try:
             if artist_name != "Unknown Artist":
-                d_res = await api_get(f"/search/album?q={urllib.parse.quote(artist_name)}&limit=50")
+                d_res = await dz_api(f"/search/album?q={urllib.parse.quote(artist_name)}&limit=50")
                 for d_album in d_res.get("result", {}).get("data", []):
                     d_art_name = d_album.get("artist", {}).get("name", "")
                     if norm(d_art_name) == norm(artist_name) or artist_name.lower() in d_art_name.lower():
@@ -871,7 +1169,7 @@ async def subsonic_proxy(endpoint: str, request: Request):
 
         if albums:
             store.put("artist_payload", artist_id, res_payload, 6 * 3600)
-            return subsonic_ok(artist=res_payload)
+            return subsonic_ok(artist=with_image(res_payload, request, params))
         
     # 2. GETSONG handling for Deezer IDs
     if endpoint == "getSong" and params.get("id", "").startswith("deezer-"):
@@ -910,41 +1208,27 @@ async def subsonic_proxy(endpoint: str, request: Request):
             res_payload = await fetch_full_deezer_album_payload(collection_id, target_id)
             return subsonic_ok(album=res_payload)
     
-    # 1c. COVER ART handling with persistent disk cache & Navidrome fallback
-    if endpoint == "getCoverArt":
-        item_id = params.get("id", "")
+    # 1c. COVER ART for our own ids (deezer-... / itunes-...); library covers come from Navidrome
+    if endpoint == "getCoverArt" and params.get("id", "").startswith(("deezer-", "itunes-")):
+        item_id = params["id"]
+        url = await resolve_cover_url(item_id)
+        if not url:
+            raise HTTPException(404, "No cover art found")
+        url = resize_deezer(url, params.get("size"))
+        headers = {"Cache-Control": "public, max-age=604800"}
+        cached = await asyncio.to_thread(read_cover, url)
+        if cached:
+            return Response(content=cached[0], media_type=cached[1], headers=headers)
+        try:
+            r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
+            if r.status_code == 200:
+                ctype = r.headers.get("content-type", "image/jpeg")
+                await asyncio.to_thread(write_cover, url, r.content, ctype)
+                return Response(content=r.content, media_type=ctype, headers=headers)
+            print(f"Cover download answered {r.status_code} for {url}")
+        except Exception as e:
+            print(f"Failed to fetch cover art from {url}: {e!r}")
+        raise HTTPException(404, "No cover art found")
 
-        # A. If it's one of our proxy IDs
-        if item_id.startswith(("deezer-", "itunes-")):
-            url = await resolve_cover_url(item_id)
-            if url:
-                headers = {"Cache-Control": "public, max-age=604800"}
-                cached = await asyncio.to_thread(read_cover, url)
-                if cached:
-                    return Response(content=cached[0], media_type=cached[1], headers=headers)
-                try:
-                    r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
-                    if r.status_code == 200:
-                        ctype = r.headers.get("content-type", "image/jpeg")
-                        await asyncio.to_thread(write_cover, url, r.content, ctype)
-                        return Response(content=r.content, media_type=ctype, headers=headers)
-                except Exception as e:
-                    print(f"Failed to fetch cover art from {url}: {e!r}")
-
-        # B. Fallback logic for local Navidrome IDs (e.g. ar-..., album IDs, or tracks)
-        url = cover_urls.get(item_id)
-        if url:
-            cached = await asyncio.to_thread(read_cover, url)
-            if cached:
-                return Response(content=cached[0], media_type=cached[1], headers={"Cache-Control": "public, max-age=604800"})
-            try:
-                r = await http.get(url, headers=ITUNES_HEADERS, timeout=httpx.Timeout(20.0, connect=8.0))
-                if r.status_code == 200:
-                    ctype = r.headers.get("content-type", "image/jpeg")
-                    await asyncio.to_thread(write_cover, url, r.content, ctype)
-                    return Response(content=r.content, media_type=ctype, headers={"Cache-Control": "public, max-age=604800"})
-            except Exception:
-                pass
     # 4. DEFAULT PASSTHROUGH TO NAVIDROME
     return await passthrough(endpoint, params)
-
