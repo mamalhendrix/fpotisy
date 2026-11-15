@@ -494,6 +494,34 @@ def itunes_playlist_to_subsonic(p: dict) -> dict:
     }
 
 
+def deezer_album_to_subsonic(a: dict) -> dict:
+    album_id = f"deezer-album-{a.get('id')}"
+    artist = (a.get("artist") or {}).get("name", "Unknown Artist")
+    title = a.get("title", "Album")
+    cover = a.get("cover_big") or a.get("cover_medium") or a.get("cover_xl")
+    if cover:
+        cover_urls[album_id] = cover
+    out = {"id": album_id, "name": title, "title": title, "album": title, "artist": artist,
+           "isDir": True, "songCount": a.get("nb_tracks", 0)}
+    if cover:
+        out["coverArt"] = album_id
+    return out
+
+
+def deezer_playlist_to_subsonic(p: dict) -> dict:
+    pid = f"deezer-playlist-{p.get('id')}"
+    title = f"[Playlist] {p.get('title', 'Playlist')}"
+    cover = p.get("picture_big") or p.get("picture_medium") or p.get("picture_xl")
+    if cover:
+        cover_urls[pid] = cover
+    out = {"id": pid, "name": title, "title": title, "album": title,
+           "artist": (p.get("creator") or p.get("user") or {}).get("name") or "Deezer",
+           "isDir": True, "songCount": p.get("nb_tracks", 0)}
+    if cover:
+        out["coverArt"] = pid
+    return out
+
+
 def norm(x) -> str:
     return "".join(c for c in (x or "").lower() if c.isalnum())
 
@@ -749,6 +777,38 @@ async def passthrough(endpoint: str, params: dict):
         background=BackgroundTask(res.aclose),
     )
 
+# ---------- HELPER: BUILD A DEEZER PLAYLIST PAGE ----------
+async def fetch_deezer_playlist_payload(playlist_id: str, album_id: str):
+    cached_payload = store.get("album", album_id)
+    if cached_payload and cached_payload[1] > time.time():
+        return cached_payload[0]
+
+    meta = (await dz_api(f"/playlist/{playlist_id}")).get("result", {}) or {}
+    tracks = list((meta.get("tracks") or {}).get("data", []))
+    total = meta.get("nb_tracks") or len(tracks)
+    while len(tracks) < min(total, 300):            # the playlist object may carry only the first tracks
+        page = (await dz_api(f"/playlist/{playlist_id}/tracks?limit=100&index={len(tracks)}")).get("result", {})
+        more = [t for t in page.get("data", []) if t.get("id")]
+        if not more:
+            break
+        tracks += more
+
+    songs = []
+    for idx, t in enumerate(tracks, 1):
+        if not t.get("id"):
+            continue
+        t["track_position"] = idx
+        song = deezer_track_to_subsonic(t)
+        song["track"] = idx
+        songs.append(song)
+
+    head = deezer_playlist_to_subsonic({**meta, "id": playlist_id})
+    payload = {**head, "songCount": len(songs), "duration": sum(s.get("duration", 0) for s in songs), "song": songs}
+    if songs:
+        store.put("album", album_id, payload, 3 * 86400)
+    return payload
+
+
 # ---------- HELPER: BUILD DEEZER ALBUM FROM DEEZER API ----------
 async def fetch_deezer_album_payload(deezer_album_id: str, album_id: str):
     cached_payload = store.get("album", album_id)
@@ -833,6 +893,9 @@ async def resolve_cover_url(item_id: str):
         if item_id.startswith("deezer-album-"):
             d = (await dz_api(f"/album/{item_id.replace('deezer-album-', '')}")).get("result") or {}
             url = d.get("cover_big") or d.get("cover_medium") or d.get("cover_xl")
+        elif item_id.startswith("deezer-playlist-"):
+            d = (await dz_api(f"/playlist/{item_id.replace('deezer-playlist-', '')}")).get("result") or {}
+            url = d.get("picture_big") or d.get("picture_medium") or d.get("picture_xl")
         elif item_id.startswith("deezer-artist-"):
             d = (await dz_api(f"/artist/{item_id.replace('deezer-artist-', '')}")).get("result") or {}
             url = d.get("picture_big") or d.get("picture_medium") or d.get("picture_xl")
@@ -993,18 +1056,31 @@ async def subsonic_proxy(endpoint: str, request: Request):
                 print(f"Deezer search failed: {e!r}")
 
             try:
+                q = urllib.parse.quote(query)
                 albums, playlists = await asyncio.gather(
-                    itunes_search("album", query, _count(params, "albumCount")),
-                    itunes_search("playlist", query, 5),
+                    dz_api(f"/search/album?q={q}&limit={_count(params, 'albumCount')}"),
+                    dz_api(f"/search/playlist?q={q}&limit=10"),
                     return_exceptions=True,
                 )
-                if not isinstance(albums, Exception):
-                    sr["album"] = local_albums + [itunes_album_to_subsonic(a) for a in albums]
-                if not isinstance(playlists, Exception):
-                    pl_extra = [itunes_playlist_to_subsonic(p) for p in playlists if p.get('collectionId')]
-                    sr["album"] = sr.get("album", local_albums) + pl_extra
-            except Exception:
-                pass
+                found_albums, found_playlists = [], []
+                if isinstance(albums, Exception):
+                    print(f"Deezer album search failed: {albums!r}")
+                else:
+                    have = {(norm(x.get("artist")), tkey(x.get("name") or x.get("album"))) for x in local_albums}
+                    for a_ in albums.get("result", {}).get("data", []):
+                        if not a_.get("id"):
+                            continue
+                        item = deezer_album_to_subsonic(a_)
+                        if (norm(item["artist"]), tkey(item["name"])) not in have:   # already in the library
+                            found_albums.append(item)
+                if isinstance(playlists, Exception):
+                    print(f"Deezer playlist search failed: {playlists!r}")
+                else:
+                    found_playlists = [deezer_playlist_to_subsonic(p_) for p_ in playlists.get("result", {}).get("data", [])
+                                       if p_.get("id")]
+                sr["album"] = local_albums + found_albums + found_playlists
+            except Exception as e:
+                print(f"Album/playlist search failed: {e!r}")
 
             sr["songCount"] = len(sr.get("song", []))
             sr["albumCount"] = len(sr.get("album", []))
@@ -1200,6 +1276,11 @@ async def subsonic_proxy(endpoint: str, request: Request):
         if target_id.startswith("deezer-album-"):
             deezer_album_id = target_id.replace("deezer-album-", "")
             res_payload = await fetch_deezer_album_payload(deezer_album_id, target_id)
+            if res_payload:
+                return subsonic_ok(album=res_payload)
+
+        if target_id.startswith("deezer-playlist-"):
+            res_payload = await fetch_deezer_playlist_payload(target_id.replace("deezer-playlist-", ""), target_id)
             if res_payload:
                 return subsonic_ok(album=res_payload)
 
